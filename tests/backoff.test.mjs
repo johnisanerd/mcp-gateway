@@ -41,7 +41,12 @@ async function runSupervisor({ minDelayMs, maxDelayMs, runTimeMs }) {
     stdio: ["ignore", "ignore", "inherit"],
   });
 
-  await new Promise((resolve) => setTimeout(resolve, runTimeMs));
+  const deadline = Date.now() + runTimeMs;
+  while (Date.now() < deadline) {
+    const samples = await readFile(spawns, "utf8").catch(() => "");
+    if (samples.trim().split("\n").filter(Boolean).length >= 5) break;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
   child.kill("SIGTERM");
   await new Promise((resolve) => child.once("exit", resolve));
 
@@ -62,7 +67,7 @@ async function runSupervisor({ minDelayMs, maxDelayMs, runTimeMs }) {
 test("quick failures back off exponentially up to the cap", async () => {
   const minDelayMs = 100;
   const maxDelayMs = 400;
-  const timestamps = await runSupervisor({ minDelayMs, maxDelayMs, runTimeMs: 1_400 });
+  const timestamps = await runSupervisor({ minDelayMs, maxDelayMs, runTimeMs: 5_000 });
 
   // Fixed 100ms restarts would spawn ~14 times; backoff 100 -> 200 -> 400 -> 400
   // yields 4-7 spawns depending on node startup jitter.
@@ -166,5 +171,71 @@ test("stale probe success and failure cannot mutate the replacement generation",
     assert.equal(failures.get("fake"),0);
     assert.equal(consecutive.get("fake"),0);
     assert.equal(inFlight.has("fake"),false);
+  }
+});
+
+test("real supervisor wiring isolates an old probe across child replacement", {timeout:30_000}, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mcp-gateway-probe-generation-"));
+  const bin = join(directory,"bin");
+  const generation = join(directory,"generation");
+  const exit = join(directory,"exit-first");
+  const releases = join(directory,"release-");
+  const observations = join(directory,"probes");
+  const config = join(directory,"servers.json");
+  await mkdir(bin);
+  const original = await readFile(join(repository,"supervisor.mjs"),"utf8");
+  assert.ok(original.includes("const startupGraceMs = 120_000"));
+  assert.ok(original.includes("const probeIntervalMs = 30_000"));
+  await writeFile(join(directory,"supervisor.mjs"),original.replace("const startupGraceMs = 120_000","const startupGraceMs = 0").replace("const probeIntervalMs = 30_000","const probeIntervalMs = 25"));
+  await writeFile(join(directory,"probe.mjs"), [
+    "import {readFileSync,appendFileSync,existsSync} from 'node:fs';",
+    "export async function probeMcp() {",
+    " const id = readFileSync(" + JSON.stringify(generation) + ",'utf8');",
+    " appendFileSync(" + JSON.stringify(observations) + ", 'start:' + id + '\n');",
+    " while (!existsSync(" + JSON.stringify(releases) + " + id)) await new Promise(resolve => setTimeout(resolve,10));",
+    " if (id === '1') throw new Error('old generation failed');",
+    "}",
+    "",
+  ].join("\n"));
+  await writeFile(join(bin,"uvx"), [
+    "#!" + process.execPath,
+    "const fs = require('node:fs');",
+    "const path = " + JSON.stringify(generation) + ";",
+    "const id = fs.existsSync(path) ? Number(fs.readFileSync(path,'utf8')) + 1 : 1;",
+    "fs.writeFileSync(path,String(id));",
+    "setInterval(() => { if (id === 1 && fs.existsSync(" + JSON.stringify(exit) + ")) process.exit(1); },10);",
+    "",
+  ].join("\n"));
+  await chmod(join(bin,"uvx"),0o755);
+  await writeFile(config,JSON.stringify({mcpServers:{fake:{port:18765,command:"unused"}}}));
+  const child = spawn(process.execPath,[join(directory,"supervisor.mjs")],{
+    env:{...process.env,HOME:directory,PATH:bin,MCP_GATEWAY_CONFIG:config,
+      MCP_GATEWAY_STATE:join(directory,"state.json"),MCP_GATEWAY_MIN_RESTART_DELAY_MS:"50",
+      MCP_GATEWAY_MAX_RESTART_DELAY_MS:"100",MCP_GATEWAY_TERMINATE_GRACE_MS:"100"},
+    stdio:["ignore","ignore","pipe"],
+  });
+  let output = "";
+  child.stderr.on("data",data => {output += data;});
+  try {
+    assert.ok(await until(async () => (await readFile(observations,"utf8").catch(() => "")).includes("start:1")),output);
+    await writeFile(exit,"");
+    assert.ok(await until(async () => (await readFile(observations,"utf8").catch(() => "")).includes("start:2")),output);
+    await writeFile(releases + "1","");
+    await new Promise(resolve => setTimeout(resolve,200));
+    const log = await readFile(observations,"utf8");
+    assert.equal(log.split("\n").filter(line => line === "start:2").length,1,"old finally released the replacement's in-flight marker");
+    assert.equal(await readFile(generation,"utf8"),"2",output);
+    assert.equal(output.includes("probe failed"),false,output);
+    const exited = new Promise(resolve => child.once("exit",resolve));
+    child.kill("SIGTERM");
+    await exited;
+    assert.equal(child.exitCode,0,output);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise(resolve => child.once("exit",resolve));
+      child.kill("SIGTERM");
+      await exited;
+    }
+    await rm(directory,{recursive:true,force:true});
   }
 });
