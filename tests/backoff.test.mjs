@@ -183,9 +183,10 @@ test("real supervisor wiring isolates an old probe across child replacement", {t
   assert.ok(original.includes("const probeIntervalMs = 30_000"));
   await writeFile(join(directory,"supervisor.mjs"),original.replace("const startupGraceMs = 120_000","const startupGraceMs = 0").replace("const probeIntervalMs = 30_000","const probeIntervalMs = 25"));
   await writeFile(join(directory,"probe.mjs"), [
-    "import {readFileSync,appendFileSync,existsSync} from 'node:fs';",
+    "import {appendFileSync,existsSync} from 'node:fs';",
+    "let count = 0;",
     "export async function probeMcp() {",
-    " const id = readFileSync(" + JSON.stringify(generation) + ",'utf8');",
+    " const id = String(++count);",
     " appendFileSync(" + JSON.stringify(observations) + ", 'start:' + id + '\\n');",
     " while (!existsSync(" + JSON.stringify(releases) + " + id)) await new Promise(resolve => setTimeout(resolve,10));",
     " if (id === '1') throw new Error('old generation failed');",
@@ -218,7 +219,7 @@ test("real supervisor wiring isolates an old probe across child replacement", {t
     await writeFile(releases + "1","");
     await new Promise(resolve => setTimeout(resolve,200));
     const log = await readFile(observations,"utf8");
-    assert.equal(log.split("\n").filter(line => line === "start:2").length,1,"old finally released the replacement's in-flight marker");
+    assert.deepEqual(log.trim().split("\n"),["start:1","start:2"],"old finally released the replacement's in-flight marker");
     assert.equal(await readFile(generation,"utf8"),"2",output);
     assert.equal(output.includes("probe failed"),false,output);
     const exited = new Promise(resolve => child.once("exit",resolve));
