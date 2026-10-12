@@ -67,29 +67,24 @@ async function runSupervisor({ minDelayMs, maxDelayMs, runTimeMs }) {
 test("quick failures back off exponentially up to the cap", async () => {
   const minDelayMs = 100;
   const maxDelayMs = 400;
+  const source = await readFile(join(repository, "supervisor.mjs"), "utf8");
+  const start = source.indexOf("function restartDelayMs(failures) {");
+  const end = source.indexOf("function scheduleRestart(", start);
+  assert.ok(start >= 0 && end > start);
+  const delay = new Function("minRestartDelayMs", "maxRestartDelayMs", "return " + source.slice(start, end))(minDelayMs, maxDelayMs);
+  assert.deepEqual([1, 2, 3, 4, 5].map(delay), [100, 200, 400, 400, 400]);
   const timestamps = await runSupervisor({ minDelayMs, maxDelayMs, runTimeMs: 5_000 });
 
-  // Fixed 100ms restarts would spawn ~14 times; backoff 100 -> 200 -> 400 -> 400
-  // yields 4-7 spawns depending on node startup jitter.
-  assert.ok(timestamps.length >= 3, `expected at least 3 spawns, got ${timestamps.length}`);
-  assert.ok(timestamps.length <= 7, `expected at most 7 spawns, got ${timestamps.length}`);
+  assert.ok(timestamps.length >= 5, `expected at least 5 spawns, got ${timestamps.length}`);
 
   const gaps = timestamps.slice(1).map((time, index) => (time - timestamps[index]) / 1e6);
   const report = gaps.map((gap) => gap.toFixed(1)).join(", ");
 
-  // Every gap carries the same spawn overhead on top of its scheduled delay,
-  // so gaps are compared against the delay they were scheduled for and growth
-  // is measured as a difference rather than a ratio; a ratio reads the shared
-  // overhead as shrinkage and flakes at these deliberately short delays.
   gaps.forEach((gap, index) => {
     const scheduled = Math.min(minDelayMs * 2 ** index, maxDelayMs);
     assert.ok(gap >= scheduled * 0.9, `gap ${index} should be >= ${scheduled}ms: ${report}`);
   });
 
-  assert.ok(
-    gaps[1] - gaps[0] >= minDelayMs * 0.5,
-    `second gap should grow by about ${minDelayMs}ms: ${report}`,
-  );
   const lastGap = gaps[gaps.length - 1];
   assert.ok(lastGap >= maxDelayMs * 0.9, `cap gap should be >= ${maxDelayMs}ms: ${report}`);
 }, 15_000);
@@ -191,7 +186,7 @@ test("real supervisor wiring isolates an old probe across child replacement", {t
     "import {readFileSync,appendFileSync,existsSync} from 'node:fs';",
     "export async function probeMcp() {",
     " const id = readFileSync(" + JSON.stringify(generation) + ",'utf8');",
-    " appendFileSync(" + JSON.stringify(observations) + ", 'start:' + id + '\n');",
+    " appendFileSync(" + JSON.stringify(observations) + ", 'start:' + id + '\\n');",
     " while (!existsSync(" + JSON.stringify(releases) + " + id)) await new Promise(resolve => setTimeout(resolve,10));",
     " if (id === '1') throw new Error('old generation failed');",
     "}",
