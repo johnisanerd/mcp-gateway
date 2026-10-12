@@ -18,7 +18,7 @@ async function runSupervisor({ minDelayMs, maxDelayMs, runTimeMs }) {
   await mkdir(bin);
   await writeFile(
     join(bin, "uvx"),
-    `#!/bin/sh\nprintf '%s\\n' "$(date +%s%N)" >> ${JSON.stringify(spawns)}\nexit 1\n`,
+    `#!${process.execPath}\nrequire("node:fs").appendFileSync(${JSON.stringify(spawns)}, String(process.hrtime.bigint()) + "\\n");\nprocess.exit(1);\n`,
     "utf8",
   );
   await chmod(join(bin, "uvx"), 0o755);
@@ -28,9 +28,10 @@ async function runSupervisor({ minDelayMs, maxDelayMs, runTimeMs }) {
     "utf8",
   );
 
-  const child = spawn("node", [join(repository, "supervisor.mjs")], {
+  const child = spawn(process.execPath, [join(repository, "supervisor.mjs")], {
     env: {
       ...process.env,
+      HOME: directory,
       PATH: `${bin}:${process.env.PATH}`,
       MCP_GATEWAY_CONFIG: config,
       MCP_GATEWAY_STATE: join(directory, "state.json"),
@@ -87,3 +88,83 @@ test("quick failures back off exponentially up to the cap", async () => {
   const lastGap = gaps[gaps.length - 1];
   assert.ok(lastGap >= maxDelayMs * 0.9, `cap gap should be >= ${maxDelayMs}ms: ${report}`);
 }, 15_000);
+
+async function until(predicate, timeoutMs = 10_000) {
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    if (await predicate()) return true;
+    await new Promise((resolve) => setTimeout(resolve, 25));
+  }
+  return false;
+}
+
+test("spawn failure without exit retries and recovers when uvx becomes available", {timeout:20_000}, async () => {
+  const directory = await mkdtemp(join(tmpdir(), "mcp-gateway-spawn-error-"));
+  const bin = join(directory, "bin");
+  const config = join(directory, "servers.json");
+  const marker = join(directory, "started");
+  await mkdir(bin);
+  await writeFile(config, JSON.stringify({mcpServers:{fake:{port:18765,command:"unused"}}}));
+  const child = spawn(process.execPath, [join(repository, "supervisor.mjs")], {
+    env:{...process.env, HOME:directory, PATH:bin, MCP_GATEWAY_CONFIG:config,
+      MCP_GATEWAY_STATE:join(directory,"state.json"), MCP_GATEWAY_MIN_RESTART_DELAY_MS:"100",
+      MCP_GATEWAY_MAX_RESTART_DELAY_MS:"200"},
+    stdio:["ignore","ignore","pipe"],
+  });
+  let output = "";
+  child.stderr.on("data", (data) => {output += data;});
+  try {
+    assert.ok(await until(() => (output.match(/failed to start/g) ?? []).length >= 2), output);
+    await writeFile(join(bin,"uvx"), "#!" + process.execPath + "\nrequire('node:fs').writeFileSync(" + JSON.stringify(marker) + ", 'ready'); setInterval(() => {}, 1000);\n");
+    await chmod(join(bin,"uvx"), 0o755);
+    assert.ok(await until(() => readFile(marker,"utf8").catch(() => null)), output);
+    const exited = new Promise((resolve) => child.once("exit", resolve));
+    child.kill("SIGTERM");
+    await exited;
+    assert.equal(child.exitCode, 0, output);
+  } finally {
+    if (child.exitCode === null && child.signalCode === null) {
+      const exited = new Promise((resolve) => child.once("exit", resolve));
+      child.kill("SIGTERM");
+      await exited;
+    }
+    await rm(directory, {recursive:true,force:true});
+  }
+});
+
+test("stale probe success and failure cannot mutate the replacement generation", async () => {
+  const source = await readFile(join(repository,"supervisor.mjs"),"utf8");
+  const beginning = source.indexOf("async function probe(name) {");
+  const end = source.indexOf("\nfunction shutdown(", beginning);
+  assert.ok(beginning >= 0 && end > beginning);
+  const createProbe = new Function("stopping", "probesInFlight", "children", "startTimes", "startupGraceMs", "probeMcp", "servers", "probeFailures", "consecutiveFailures", "failedProbesBeforeRestart", "terminate", "return " + source.slice(beginning,end));
+  for (const failure of [false,true]) {
+    const old = {};
+    const replacement = {};
+    const children = new Map([["fake",old]]);
+    const inFlight = new Map();
+    const failures = new Map([["fake",2]]);
+    const consecutive = new Map([["fake",5]]);
+    const requests = [];
+    const terminations = [];
+    const probe = createProbe(false,inFlight,children,new Map([["fake",0]]),0,
+      () => new Promise((resolve,reject) => {requests.push({resolve,reject});}),
+      {fake:{port:18765}},failures,consecutive,3,(name) => {terminations.push(name);});
+    const first = probe("fake");
+    children.set("fake",replacement);
+    inFlight.delete("fake");
+    const second = probe("fake");
+    if (failure) requests[0].reject(new Error("stale failure"));
+    else requests[0].resolve();
+    await first;
+    assert.equal(failures.get("fake"),2);
+    assert.equal(consecutive.get("fake"),5);
+    assert.equal(inFlight.get("fake"),replacement);
+    assert.deepEqual(terminations,[]);
+    requests[1].resolve();
+    await second;
+    assert.equal(failures.get("fake"),0);
+    assert.equal(consecutive.get("fake"),0);
+    assert.equal(inFlight.has("fake"),false);
+  }
+});

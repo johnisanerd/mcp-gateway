@@ -55,10 +55,11 @@ async function fixture({ uvx }) {
   return { directory, bin, config, state: join(directory, "state.json") };
 }
 
-function startSupervisor({ bin, config, state }) {
-  return spawn("node", [join(repository, "supervisor.mjs")], {
+function startSupervisor({ directory, bin, config, state }) {
+  const child = spawn(process.execPath, [join(repository, "supervisor.mjs")], {
     env: {
       ...process.env,
+      HOME: directory,
       PATH: `${bin}:${process.env.PATH}`,
       MCP_GATEWAY_CONFIG: config,
       MCP_GATEWAY_STATE: state,
@@ -66,8 +67,13 @@ function startSupervisor({ bin, config, state }) {
       MCP_GATEWAY_MAX_RESTART_DELAY_MS: "200",
       MCP_GATEWAY_TERMINATE_GRACE_MS: "500",
     },
-    stdio: ["ignore", "ignore", "inherit"],
+    stdio: ["ignore", "pipe", "pipe"],
   });
+  let output = "";
+  child.stdout.on("data", (data) => { output += data; });
+  child.stderr.on("data", (data) => { output += data; });
+  child.output = () => output;
+  return child;
 }
 
 test("stopping a server kills the whole downstream tree", async () => {
@@ -152,3 +158,101 @@ test("state recorded under a different boot is not acted on", async () => {
     await rm(context.directory, { recursive: true, force: true });
   }
 }, 30_000);
+
+async function leakyFixture() {
+  const context = await fixture({ uvx: "" });
+  context.marker = join(context.directory, "descendant.json");
+  context.started = join(context.directory, "replacement");
+  const descendant = "process.on('SIGTERM', () => {}); require('node:fs').writeFileSync(process.argv[1], JSON.stringify({pid:process.pid,group:process.argv[2]})); setInterval(() => {}, 1000);";
+  const program = [
+    "#!" + process.execPath,
+    "const fs = require('node:fs');",
+    "const {spawn} = require('node:child_process');",
+    "const marker = " + JSON.stringify(context.marker) + ";",
+    "if (!fs.existsSync(marker)) {",
+    "  spawn(process.execPath, ['-e', " + JSON.stringify(descendant) + ", marker, String(process.pid)], {stdio:'ignore'});",
+    "  const timer = setInterval(() => {if (fs.existsSync(marker)) {clearInterval(timer); process.exit(1);}}, 5);",
+    "} else {",
+    "  fs.writeFileSync(" + JSON.stringify(context.started) + ", String(Date.now()));",
+    "  setInterval(() => {}, 1000);",
+    "}",
+    "",
+  ].join("\n");
+  await writeFile(join(context.bin, "uvx"), program, "utf8");
+  return context;
+}
+
+async function stopFixture(context, supervisor) {
+  if (supervisor && supervisor.exitCode === null && supervisor.signalCode === null) {
+    supervisor.kill("SIGKILL");
+    await settle(supervisor, 2_000);
+  }
+  const state = JSON.parse(await readFile(context.state, "utf8").catch(() => "{}"));
+  const marker = JSON.parse(await readFile(context.marker, "utf8").catch(() => "{}"));
+  for (const pid of [...Object.values(state.groups ?? {}), Number(marker.group)]) {
+    if (!Number.isInteger(pid) || pid <= 1) continue;
+    try { process.kill(-pid, "SIGKILL"); } catch (error) {
+      if (error.code !== "ESRCH") throw error;
+    }
+  }
+  await rm(context.directory, {recursive:true, force:true});
+}
+
+async function pendingSweep(context, supervisor) {
+  assert.ok(await until(() => supervisor.output().includes("sweeping fake process group"), 10_000), supervisor.output());
+  const marker = JSON.parse(await readFile(context.marker, "utf8"));
+  const state = JSON.parse(await readFile(context.state, "utf8"));
+  assert.equal(state.groups.fake, Number(marker.group), "pending cleanup must remain recoverable");
+  return marker;
+}
+
+function isGone(pid) {
+  try { process.kill(pid, 0); return false; } catch (error) {
+    if (error.code === "ESRCH") return true;
+    throw error;
+  }
+}
+
+test("replacement waits for a TERM-ignoring descendant and retains recovery state", {timeout:30_000}, async () => {
+  const context = await leakyFixture();
+  const supervisor = startSupervisor(context);
+  try {
+    const marker = await pendingSweep(context, supervisor);
+    assert.equal(await readFile(context.started, "utf8").catch(() => null), null);
+    assert.ok(await until(() => isGone(marker.pid), 10_000), supervisor.output());
+    assert.ok(await until(() => readFile(context.started, "utf8").catch(() => null), 10_000), supervisor.output());
+    supervisor.kill("SIGTERM");
+    assert.equal(await settle(supervisor, 10_000), "exited", supervisor.output());
+    assert.equal(supervisor.exitCode, 0, supervisor.output());
+  } finally { await stopFixture(context, supervisor); }
+});
+
+test("shutdown waits for an already pending descendant sweep", {timeout:30_000}, async () => {
+  const context = await leakyFixture();
+  const supervisor = startSupervisor(context);
+  try {
+    const marker = await pendingSweep(context, supervisor);
+    supervisor.kill("SIGTERM");
+    assert.equal(await settle(supervisor, 10_000), "exited", supervisor.output());
+    assert.equal(supervisor.exitCode, 0, supervisor.output());
+    assert.ok(await until(() => isGone(marker.pid), 5_000), "descendant survived shutdown");
+    assert.equal(await readFile(context.started, "utf8").catch(() => null), null);
+  } finally { await stopFixture(context, supervisor); }
+});
+
+test("SIGKILL during a sweep leaves the group recoverable by the next supervisor", {timeout:30_000}, async () => {
+  const context = await leakyFixture();
+  let supervisor = startSupervisor(context);
+  try {
+    const marker = await pendingSweep(context, supervisor);
+    supervisor.kill("SIGKILL");
+    assert.equal(await settle(supervisor, 5_000), "exited");
+    assert.equal(isGone(marker.pid), false, "fixture should survive until recovery");
+    supervisor = startSupervisor(context);
+    assert.ok(await until(() => isGone(marker.pid), 10_000), supervisor.output());
+    assert.ok(await until(() => readFile(context.started, "utf8").catch(() => null), 10_000), supervisor.output());
+    supervisor.kill("SIGTERM");
+    assert.equal(await settle(supervisor, 10_000), "exited", supervisor.output());
+    assert.equal(supervisor.exitCode, 0, supervisor.output());
+  } finally { await stopFixture(context, supervisor); }
+});
