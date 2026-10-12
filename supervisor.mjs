@@ -170,6 +170,7 @@ async function reapPreviousRun() {
   )
   if (stale.length === 0) return
 
+  for (const [name, pid] of stale) cleanupGroups.set(name, pid)
   await Promise.all(stale.map(([name, pid]) => cleanup(name, pid)))
 }
 
@@ -208,7 +209,8 @@ async function sweepGroup(name, pid, deadline) {
 }
 
 function finishShutdown() {
-  if (stopping && children.size === 0 && cleanups.size === 0) {
+  if (stopping && children.size === 0 && cleanups.size === 0 &&
+      (cleanupGroups.size === 0 || process.exitCode === 1)) {
     process.exit(process.exitCode ?? 0)
   }
 }
@@ -231,6 +233,7 @@ function cleanupFailure(error) {
   console.error(`[mcp-gateway] cleanup failed: ${error.message}`)
   process.exitCode = 1
   shutdown("cleanup failure")
+  finishShutdown()
 }
 
 // Consecutive quick failures back off exponentially (auth expiry and other
