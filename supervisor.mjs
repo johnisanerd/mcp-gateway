@@ -1,5 +1,5 @@
 import { spawn } from "node:child_process"
-import { readFileSync, mkdirSync, writeFileSync } from "node:fs"
+import { readFileSync, mkdirSync, writeFileSync, renameSync } from "node:fs"
 import { homedir, uptime } from "node:os"
 import { dirname, join } from "node:path"
 import { probeMcp } from "./probe.mjs"
@@ -33,7 +33,10 @@ const startTimes = new Map()
 const probeFailures = new Map()
 const consecutiveFailures = new Map()
 const healthyTimers = new Map()
-const probesInFlight = new Set()
+const probesInFlight = new Map()
+const cleanups = new Map()
+const cleanupGroups = new Map()
+const stopDeadlines = new Map()
 let stopping = false
 
 const allowedEnvironment = [
@@ -114,10 +117,15 @@ function bootSeconds() {
 }
 
 function writeState() {
-  const groups = Object.fromEntries([...children].map(([name, child]) => [name, child.pid]))
+  const groups = Object.fromEntries([
+    ...[...children].filter(([, child]) => child.pid).map(([name, child]) => [name, child.pid]),
+    ...cleanupGroups,
+  ])
   try {
     mkdirSync(dirname(statePath), { recursive: true })
-    writeFileSync(statePath, `${JSON.stringify({ boot: bootSeconds(), groups })}\n`, "utf8")
+    const temporary = `${statePath}.${process.pid}.tmp`
+    writeFileSync(temporary, `${JSON.stringify({ boot: bootSeconds(), groups })}\n`, { mode: 0o600 })
+    renameSync(temporary, statePath)
   } catch (error) {
     console.error(`[mcp-gateway] could not record supervisor state: ${error.message}`)
   }
@@ -162,27 +170,15 @@ async function reapPreviousRun() {
   )
   if (stale.length === 0) return
 
-  for (const [name, pid] of stale) {
-    console.error(`[mcp-gateway] sweeping orphaned ${name} process group ${pid}`)
-    signalGroup(pid, "SIGTERM")
-  }
-
-  const deadline = Date.now() + terminateGraceMs
-  while (stale.length > 0 && Date.now() < deadline) {
-    await new Promise((resolve) => setTimeout(resolve, 100))
-    stale = stale.filter(([, pid]) => groupAlive(pid))
-  }
-
-  for (const [name, pid] of stale) {
-    console.error(`[mcp-gateway] orphaned ${name} process group ${pid} ignored SIGTERM; forcing`)
-    signalGroup(pid, "SIGKILL")
-  }
+  for (const [name, pid] of stale) cleanupGroups.set(name, pid)
+  await Promise.all(stale.map(([name, pid]) => cleanup(name, pid)))
 }
 
 // Signal a running child's whole group, escalating if it does not go away.
 function terminate(name) {
   const child = children.get(name)
   if (!child || killTimers.has(name)) return
+  stopDeadlines.set(name, Date.now() + terminateGraceMs)
   signalGroup(child.pid, "SIGTERM")
   const timer = setTimeout(() => {
     killTimers.delete(name)
@@ -194,13 +190,50 @@ function terminate(name) {
   killTimers.set(name, timer)
 }
 
-// The proxy can exit on its own while the wrappers it started stay alive, so
-// an exit is swept the same way a deliberate restart is.
-function sweepGroup(name, pid) {
+async function waitForGroup(pid, deadline) {
+  while (groupAlive(pid) && Date.now() < deadline) {
+    await new Promise((resolve) => setTimeout(resolve, 25))
+  }
+  return !groupAlive(pid)
+}
+
+async function sweepGroup(name, pid, deadline) {
   if (!signalGroup(pid, "SIGTERM")) return
-  console.error(`[mcp-gateway] ${name} left a running process group; sweeping ${pid}`)
-  const timer = setTimeout(() => signalGroup(pid, "SIGKILL"), terminateGraceMs)
-  timer.unref()
+  console.error(`[mcp-gateway] sweeping ${name} process group ${pid}`)
+  if (await waitForGroup(pid, deadline)) return
+  console.error(`[mcp-gateway] ${name} process group ${pid} ignored SIGTERM; forcing`)
+  signalGroup(pid, "SIGKILL")
+  if (!(await waitForGroup(pid, Date.now() + 1_000))) {
+    throw new Error(`${name}: process group ${pid} survived SIGKILL`)
+  }
+}
+
+function finishShutdown() {
+  if (stopping && children.size === 0 && cleanups.size === 0 &&
+      (cleanupGroups.size === 0 || process.exitCode === 1)) {
+    process.exit(process.exitCode ?? 0)
+  }
+}
+
+function cleanup(name, pid, deadline = Date.now() + terminateGraceMs) {
+  cleanupGroups.set(name, pid)
+  const pending = sweepGroup(name, pid, deadline).then(() => {
+    cleanupGroups.delete(name)
+  }).finally(() => {
+    cleanups.delete(name)
+    writeState()
+    finishShutdown()
+  })
+  cleanups.set(name, pending)
+  writeState()
+  return pending
+}
+
+function cleanupFailure(error) {
+  console.error(`[mcp-gateway] cleanup failed: ${error.message}`)
+  process.exitCode = 1
+  shutdown("cleanup failure")
+  finishShutdown()
 }
 
 // Consecutive quick failures back off exponentially (auth expiry and other
@@ -226,6 +259,7 @@ function uvCacheDir(name) {
 }
 
 function start(name) {
+  if (stopping || children.has(name) || cleanups.has(name)) return
   const server = servers[name]
   const environment = {
     ...baseEnvironment(),
@@ -260,37 +294,42 @@ function start(name) {
   writeState()
   const healthyTimer = setTimeout(() => {
     healthyTimers.delete(name)
-    consecutiveFailures.set(name, 0)
+    if (children.get(name) === child) consecutiveFailures.set(name, 0)
   }, startupGraceMs)
   healthyTimer.unref()
   healthyTimers.set(name, healthyTimer)
 
-  child.on("error", (error) => {
-    console.error(`[mcp-gateway] ${name} failed to start: ${error.message}`)
-  })
-
-  child.on("exit", (code, signal) => {
+  let finalized = false
+  function exited(code, signal) {
+    if (finalized || children.get(name) !== child) return
+    finalized = true
     children.delete(name)
     startTimes.delete(name)
     probeFailures.delete(name)
+    probesInFlight.delete(name)
     clearTimeout(healthyTimers.get(name))
     healthyTimers.delete(name)
     clearTimeout(killTimers.get(name))
     killTimers.delete(name)
-    sweepGroup(name, child.pid)
-    writeState()
-    if (stopping) {
-      if (children.size === 0) process.exit(0)
-      return
-    }
+    const deadline = stopDeadlines.get(name) ?? Date.now() + terminateGraceMs
+    stopDeadlines.delete(name)
     const failures = (consecutiveFailures.get(name) ?? 0) + 1
     consecutiveFailures.set(name, failures)
     const delayMs = restartDelayMs(failures)
-    console.error(
-      `[mcp-gateway] ${name} exited (${signal ?? `code ${code}`}); restart ${failures} in ${delayMs / 1_000}s`,
-    )
-    scheduleRestart(name, delayMs)
+    void cleanup(name, child.pid, deadline).then(() => {
+      if (stopping) return
+      console.error(
+        `[mcp-gateway] ${name} exited (${signal ?? `code ${code}`}); restart ${failures} in ${delayMs / 1_000}s`,
+      )
+      scheduleRestart(name, delayMs)
+    }).catch(cleanupFailure)
+  }
+
+  child.on("error", (error) => {
+    console.error(`[mcp-gateway] ${name} failed to start: ${error.message}`)
+    if (!child.pid) exited(null, error.code)
   })
+  child.on("exit", exited)
 }
 
 async function probe(name) {
@@ -298,14 +337,17 @@ async function probe(name) {
   const startedAt = startTimes.get(name) ?? Date.now()
   if (Date.now() - startedAt < startupGraceMs) return
 
-  probesInFlight.add(name)
+  const child = children.get(name)
+  probesInFlight.set(name, child)
   try {
     await probeMcp(servers[name].port)
+    if (stopping || children.get(name) !== child) return
     probeFailures.set(name, 0)
     // A server answering the probe is healthy however badly it started, so a
     // recovered server is not left pinned at the maximum restart delay.
     consecutiveFailures.set(name, 0)
   } catch (error) {
+    if (stopping || children.get(name) !== child) return
     const failures = (probeFailures.get(name) ?? 0) + 1
     probeFailures.set(name, failures)
     console.error(
@@ -316,7 +358,7 @@ async function probe(name) {
       terminate(name)
     }
   } finally {
-    probesInFlight.delete(name)
+    if (probesInFlight.get(name) === child) probesInFlight.delete(name)
   }
 }
 
@@ -327,12 +369,7 @@ function shutdown(signal) {
   for (const timer of restartTimers.values()) clearTimeout(timer)
   restartTimers.clear()
   for (const name of [...children.keys()]) terminate(name)
-  if (children.size === 0) process.exit(0)
-
-  const forceTimer = setTimeout(() => {
-    for (const child of children.values()) signalGroup(child.pid, "SIGKILL")
-  }, terminateGraceMs)
-  forceTimer.unref()
+  finishShutdown()
 }
 
 validate()
@@ -345,7 +382,7 @@ if (process.argv.includes("--check")) {
 process.on("SIGINT", () => shutdown("SIGINT"))
 process.on("SIGTERM", () => shutdown("SIGTERM"))
 
-await reapPreviousRun()
+await reapPreviousRun().catch(cleanupFailure)
 
 for (const name of Object.keys(servers)) start(name)
 

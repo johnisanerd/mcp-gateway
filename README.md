@@ -70,11 +70,16 @@ connection refused on a port the supervisor believes it is serving.
 
 A stop escalates to `SIGKILL` after `MCP_GATEWAY_TERMINATE_GRACE_MS`
 (10s by default), and a proxy that exits on its own is swept the same way,
-because it can die while the wrappers it started keep running.
+because it can die while the wrappers it started keep running. Replacement
+startup and its backoff timer wait for that sweep; shutdown also waits for
+pending sweeps. Cleanup allows up to one additional second after SIGKILL.
+If a group still exists, the supervisor exits unsuccessfully without starting
+a conflicting replacement and retains the group for next-run recovery.
 
 The supervisor records its process group ids in
 `~/.cache/mcp-gateway/supervisor-state.json` and sweeps any that survive into
-the next run, covering the case where the supervisor itself was killed outright
+the next run, including exited proxies whose descendant sweeps are still pending. State
+updates use atomic replacement, covering the case where the supervisor itself was killed outright
 rather than asked to stop. Group ids cannot outlive a reboot, so the file
 records the boot it was written under and is discarded when that no longer
 matches; a recycled group id is never signalled. Run a second supervisor only
