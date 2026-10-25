@@ -17,7 +17,7 @@ export MCP_REMOTE_AUTH_TOKEN
 # mcp-remote expands this placeholder from its child environment.
 # shellcheck disable=SC2016
 exec npx -y 'mcp-remote@0.1.38' \
-  'https://mcp.apify.com/?tools=actors,apify/facebook-marketplace-scraper,apify/google-maps-scraper&telemetry-enabled=false' \
+  'https://mcp.apify.com/?tools=actors,apify/facebook-marketplace-scraper,johnvc/google-maps-places-api&telemetry-enabled=false' \
   --header 'Authorization: Bearer ${MCP_REMOTE_AUTH_TOKEN}' \
   --transport http-only \
   --silent
